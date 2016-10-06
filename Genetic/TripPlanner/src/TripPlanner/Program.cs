@@ -4,6 +4,9 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 
 namespace TripPlanner
@@ -16,7 +19,7 @@ namespace TripPlanner
         {
             try
             {
-                var destinations = @"Innsbruck, Austria
+               var destinations = @"Innsbruck, Austria
 Munich, Germany
 Pag, Croatia
 Venice, Italy
@@ -49,7 +52,7 @@ Luberone, Bonnieux, France
 Nice, France
 Monte Carlo, Monaco
 Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
-                
+
                 //Grab API key
                 var apikey = "INSERTAPIKEY";
                 if (File.Exists("apikey.ignore"))
@@ -71,8 +74,12 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
 
                 var distanceMatrix = GenerateDistanceDictionary(ReadAsCSV(path_distances).Skip(1).ToList());
 
-                var shortest = RunDarwinian(destinations, distanceMatrix);
-                Console.Write("Shortest path found:");
+                int generations = 10000;
+                int populationSize = 1000;
+                int survivorSizePerc = 20;
+                
+                var shortest = RunDarwinian(destinations, distanceMatrix, generations, populationSize, survivorSizePerc);
+                Console.Write("Shortest path found(generations {0}, populationsize {1}, survivor% {2}:", generations, populationSize, survivorSizePerc);
                 Console.WriteLine(shortest.ToString());
                 
 #if DEBUG
@@ -94,32 +101,54 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
             Route shortestRoute = null;
             int nonImprovedCount = 0;
 
+            // generate an initial randomized population
             var routes = new List<Route>();
+            routes.Add(new Route(destinations, distanceMatrix)); // add unshuffled item
             for (int x = 0; x < populationSize; x++) routes.Add(GenerateShuffledRoute(destinations, distanceMatrix));
 
+
+            // Run generational mutations
             for (int generation = 0; generation < generations; generation++)
             {
-                var shortestInThisPopulation = routes.OrderBy(x=>x.Distance).First();
+                var shortestInThisPopulation = routes.OrderBy(x => x.Distance).First();
                 if (shortestRoute == null) shortestRoute = shortestInThisPopulation;
+
                 if (shortestInThisPopulation.Distance < shortestRoute.Distance)
                 {
                     shortestRoute = shortestInThisPopulation;
                     nonImprovedCount = 0;
-                    if (nonImprovedCount == 3) break; // have not improved in 3 generations so exit.
                 }
-                Console.WriteLine($"Generation {generation} evolved a route {shortestInThisPopulation.Distance} long.  The shortest so far is {shortestRoute.Distance}");
+
+                if (generation%100 == 0)
+                    Console.WriteLine(
+                        $"Generation {generation} evolved a route {shortestInThisPopulation.Distance} long.  The shortest so far is {shortestRoute.Distance}");
 
                 // grab the shortest survivors.
-                var shortestSurvivors = routes.OrderBy(x=>x.Distance).Take(populationSize/survivorSizePerc).ToList();
+                var shortestSurvivors = routes.OrderBy(x => x.Distance).Take(populationSize/survivorSizePerc).ToList();
 
                 // rebuild population
                 var tmpRoutes = new List<Route>();
-                tmpRoutes.AddRange(shortestSurvivors);  // add shortest items
-                for (int x = 0; x < populationSize-11; x++) tmpRoutes.Add(GenerateShuffledRoute(destinations, distanceMatrix));
-                tmpRoutes.AddRange(shortestSurvivors.Select(x => MutateRoute(x, 10)));
-                tmpRoutes.AddRange(routes.Select(x => MutateRoute(x, 20)).Take(populationSize - tmpRoutes.Count)); // mutate the remaining spaces a lot
-                routes.Clear();
-                routes.AddRange(tmpRoutes);
+                tmpRoutes.Add(shortestRoute); // add shortest item
+
+                // SUPERMAN theory - mutate shortest path multiple times to seed next generation
+                while (tmpRoutes.Count < populationSize/survivorSizePerc)
+                    tmpRoutes.Add(Route.MutateRoute(shortestRoute, _random, 1));
+                while (tmpRoutes.Count < (populationSize/survivorSizePerc)*2)
+                    tmpRoutes.Add(Route.MutateRoute(shortestInThisPopulation, _random, 1));
+
+                // Mutate shortest survivors a bit and add those too
+                tmpRoutes.AddRange(shortestSurvivors.Select(x => Route.MutateRoute(x, _random, 1)));
+                tmpRoutes.AddRange(shortestSurvivors.Select(x => Route.MutateRoute(x, _random, 2)));
+                tmpRoutes.AddRange(shortestSurvivors.Select(x => Route.MutateRoute(x, _random, 3)));
+                tmpRoutes.AddRange(shortestSurvivors.Select(x => Route.MutateRoute(x, _random, 5)));
+                tmpRoutes.AddRange(shortestSurvivors.Select(x => Route.MutateRoute(x, _random, 10)));
+
+                // Add some random entries to fill the population
+                while (tmpRoutes.Count < populationSize)
+                    tmpRoutes.Add(GenerateShuffledRoute(destinations, distanceMatrix));
+
+                //Interlocked.Add(routes, tmpRoutes);
+                routes = (tmpRoutes);
             }
 
             Console.WriteLine($"All generations have executed.  The shortest path found is {shortestRoute.Distance}.");
@@ -157,21 +186,6 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
                 scores.Add(distanceTotal, population);
             }
             return scores;
-        }
-
-        private static Route MutateRoute(Route route, int mutations)
-        {
-            var tmp = new Leg();
-            
-            for (int mut = 0; mut < mutations; mut++)
-            {
-                var x = _random.Next(0, route.Legs.Count - 1);
-                var y = _random.Next(0, route.Legs.Count - 1);
-                tmp = route.Legs[x];
-                route.Legs[x] = route.Legs[y];
-                route.Legs[y] = tmp;
-            }
-            return route;
         }
 
         private static Route GenerateShuffledRoute(List<string> destinations, SortedDictionary<string, int> distanceMatrix)
@@ -281,6 +295,10 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
             return (s + s1).Replace(" ", "_").Replace("\r", "");
         }
 
+        public List<string> Destinations { get; set; }
+
+        public SortedDictionary<string, int> DistanceMatrix { get; set; }
+
         public List<Leg> Legs { get; set; }
 
         public Route()
@@ -291,8 +309,34 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
         public Route(List<string> destinations, SortedDictionary<string, int> distanceMatrix)
         {
             Legs = new List<Leg>();
+            Destinations = destinations;
+            DistanceMatrix = distanceMatrix;
+            CalculateRoute();
+        }
+
+        public static Route MutateRoute(Route route, Random random, int mutations)
+        {
+            // Breeding!
+            var newRoute = new Route(route.Destinations, route.DistanceMatrix);
+
+            var tmp = "";
+            for (int mut = 0; mut < mutations; mut++)
+            {
+                var x = random.Next(0, newRoute.Destinations.Count - 1);
+                var y = random.Next(0, newRoute.Destinations.Count - 1);
+                tmp = newRoute.Destinations[x];
+                newRoute.Destinations[x] = newRoute.Destinations[y];
+                newRoute.Destinations[y] = tmp;
+            }
+            newRoute.CalculateRoute();
+            return newRoute;
+        }
+
+        private void CalculateRoute()
+        {
+            Legs = new List<Leg>();
             string currentLocation = "";
-            foreach (var destination in destinations)
+            foreach (var destination in Destinations)
             {
                 if (currentLocation == "")
                 {
@@ -302,7 +346,7 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
                 var leg = new Leg();
                 leg.Start = currentLocation;
                 leg.Finish = destination;
-                leg.Distance = distanceMatrix[Tokenize(currentLocation, destination)];
+                leg.Distance = DistanceMatrix[Tokenize(currentLocation, destination)];
                 Legs.Add(leg);
                 currentLocation = destination;
             }
@@ -318,7 +362,7 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
 
         public override string ToString()
         {
-            string st = $"Route is {Distance/1000}km long";
+            string st = $"{this.GetHashCode()} - Route is {Distance/1000}km long ";
             Legs.ForEach(x=> st = st + "\n"+x.ToString());
 
             return st;
@@ -333,7 +377,7 @@ Interlaken, Switzerland".Replace("\r", "").Split('\n').ToList();
 
         public override string ToString()
         {
-            return this.Start + " --> " + this.Finish + " - " + this.Distance;
+            return this.Start + " --> " + this.Finish + " - " + this.Distance + " ";
         }
     }
 }
